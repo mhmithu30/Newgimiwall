@@ -10,15 +10,50 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const INTERVAL_MIN = Number(process.env.CHECK_INTERVAL_MIN || 30);
 
 const seen = new Set();
-let dailySentDate = "";
 
-async function tg(message) {
+async function tg(msg) {
   await axios.post(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
     chat_id: CHAT_ID,
-    text: message,
+    text: msg.slice(0, 3900),
     parse_mode: "HTML",
     disable_web_page_preview: true
   });
+}
+
+function findOffersFromJson(data) {
+  const found = [];
+
+  function walk(x) {
+    if (!x) return;
+
+    if (Array.isArray(x)) {
+      x.forEach(walk);
+      return;
+    }
+
+    if (typeof x === "object") {
+      const keys = Object.keys(x).map(k => k.toLowerCase());
+
+      const title =
+        x.title || x.name || x.offer_name || x.offerName || x.campaign_name || x.campaignName;
+
+      const points =
+        x.points || x.reward || x.payout || x.amount || x.coins || x.virtual_currency_amount;
+
+      if (title && (points || keys.includes("payout") || keys.includes("reward"))) {
+        found.push({
+          title: String(title),
+          points: points ? String(points) : "Unknown"
+        });
+      }
+
+      Object.values(x).forEach(walk);
+    }
+  }
+
+  walk(data);
+
+  return found;
 }
 
 async function getOffers() {
@@ -31,9 +66,7 @@ async function getOffers() {
 
   const browser = await chromium.launch({
     headless: true,
-    proxy: {
-      server: newProxyUrl
-    }
+    proxy: { server: newProxyUrl }
   });
 
   const page = await browser.newPage({
@@ -41,17 +74,36 @@ async function getOffers() {
     timezoneId: "America/New_York",
     viewport: { width: 1366, height: 768 },
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36"
+  });
+
+  const apiUrls = new Set();
+  let offers = [];
+
+  page.on("response", async (res) => {
+    const url = res.url();
+
+    if (
+      url.includes("api") ||
+      url.includes("offer") ||
+      url.includes("campaign") ||
+      url.includes("wall")
+    ) {
+      apiUrls.add(url);
+
+      try {
+        const ct = res.headers()["content-type"] || "";
+        if (ct.includes("application/json")) {
+          const json = await res.json();
+          offers.push(...findOffersFromJson(json));
+        }
+      } catch {}
+    }
   });
 
   try {
-    await page.goto(URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
-    });
-
-    await page.waitForTimeout(12000);
+    await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.waitForTimeout(20000);
 
     const ipText = await page.evaluate(async () => {
       try {
@@ -63,133 +115,60 @@ async function getOffers() {
       }
     });
 
-    const offers = await page.evaluate(() => {
-      const blockedWords = [
-        "gemiwall",
-        "offerwall",
-        "privacy",
-        "history",
-        "navigation",
-        "powered by",
-        "checking",
-        "loading"
-      ];
-
-      const nodes = document.querySelectorAll(
-        "a, button, [class*='offer'], [class*='card'], [data-offer]"
-      );
-
-      const items = [];
-
-      nodes.forEach((el) => {
-        const text = (el.innerText || el.textContent || "")
-          .replace(/\s+/g, " ")
-          .trim();
-
-        const low = text.toLowerCase();
-
-        if (
-          text.length >= 12 &&
-          text.length <= 250 &&
-          !blockedWords.some((w) => low.includes(w))
-        ) {
-          items.push({
-            id: low,
-            title: text,
-            link: el.href || location.href
-          });
-        }
-      });
-
-      return [...new Map(items.map((item) => [item.id, item])).values()];
-    });
+    offers = [...new Map(offers.map(o => [o.title.toLowerCase(), o])).values()];
 
     await browser.close();
     await ProxyChain.closeAnonymizedProxy(newProxyUrl, true);
 
-    return { offers, ipText };
-  } catch (error) {
+    return { offers, ipText, apiUrls: [...apiUrls] };
+  } catch (e) {
     await browser.close();
     await ProxyChain.closeAnonymizedProxy(newProxyUrl, true);
-    throw error;
+    throw e;
   }
 }
 
 async function checkNewOffers() {
   try {
-    await tg("⏰ Checking offers...");
+    console.log("Checking offers...");
 
-    const { offers, ipText } = await getOffers();
-
-    if (!ipText.includes("US")) {
-      await tg(`⚠️ <b>Proxy/IP Warning</b>\n${ipText}`);
-    }
+    const { offers, ipText, apiUrls } = await getOffers();
 
     if (!offers.length) {
       await tg(
-        "❌ Could not fetch offers.\n\nReason: no offer found after page load.\nMaybe proxy blocked, USA mismatch, or offerwall API not loading."
+        `❌ <b>No offers found</b>\n\n` +
+        `📡 ${ipText}\n\n` +
+        `Detected API URLs:\n${apiUrls.slice(0, 10).join("\n") || "No API found"}`
       );
       return;
     }
 
-    let newCount = 0;
-
     for (const offer of offers) {
-      if (!seen.has(offer.id)) {
-        seen.add(offer.id);
-        newCount++;
+      const id = `${offer.title}-${offer.points}`.toLowerCase();
+
+      if (!seen.has(id)) {
+        seen.add(id);
 
         await tg(
-          `🆕 <b>New USA Offer Found</b>\n\n` +
-          `${offer.title}\n\n` +
-          `🌐 ${offer.link}\n\n` +
+          `🆕 <b>New Offer Found</b>\n\n` +
+          `🎯 <b>Offer name:</b> ${offer.title}\n` +
+          `💎 <b>Point:</b> ${offer.points}\n` +
+          `🇺🇸 <b>Country:</b> USA\n\n` +
           `📡 ${ipText}`
         );
       }
     }
-
-    if (newCount === 0) {
-      console.log("No new offers.");
-    }
-
-    console.log(`Checked: ${offers.length}, New: ${newCount}`);
-  } catch (error) {
-    await tg(`❌ <b>Bot/IP Error</b>\n${error.message}`);
-  }
-}
-
-async function dailyReport() {
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const hour = new Date().getUTCHours();
-
-    if (dailySentDate === today) return;
-    if (hour !== 3) return;
-
-    const { offers, ipText } = await getOffers();
-    dailySentDate = today;
-
-    let message =
-      `🇺🇸 <b>Daily USA Offer Report</b>\n` +
-      `Total Found: ${offers.length}\n` +
-      `📡 ${ipText}\n\n`;
-
-    offers.slice(0, 40).forEach((offer, index) => {
-      message += `${index + 1}. ${offer.title}\n\n`;
-    });
-
-    await tg(message.slice(0, 3900));
-  } catch (error) {
-    await tg(`❌ Daily report failed:\n${error.message}`);
+  } catch (e) {
+    await tg(`❌ <b>Bot/IP Error</b>\n${e.message}`);
   }
 }
 
 async function run() {
-  await tg("✅ GemiWall Monitor Bot started.");
+  console.log("Bot started");
+  await tg("✅ Bot started one time.");
   await checkNewOffers();
 
   setInterval(checkNewOffers, INTERVAL_MIN * 60 * 1000);
-  setInterval(dailyReport, 30 * 60 * 1000);
 }
 
 run();
